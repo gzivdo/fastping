@@ -1,0 +1,26 @@
+[package]
+name = "fastping"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Stateless mass ICMP-echo sweeper with adaptive retry; raw-socket and AF_PACKET backends, Zabbix integration"
+repository = "https://github.com/gzivdo/fastping"
+
+[dependencies]
+socket2 = { version = "0.6.4", features = ["all"] }
+libc = "0.2"
+
+[[bin]]
+name = "fastping"
+path = "src/bin/fastping.rs"
+
+[[bin]]
+name = "fastping-afpacket"
+path = "src/bin/fastping-afpacket.rs"
+
+[profile.release]
+opt-level = "z"      # optimize for size
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true

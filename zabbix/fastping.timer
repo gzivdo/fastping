@@ -1,0 +1,12 @@
+[Unit]
+Description=Run fastping ICMP sweep every minute
+
+[Timer]
+OnBootSec=30s
+OnUnitActiveSec=60s
+AccuracySec=1s
+# don't pile up runs if one is slow
+Persistent=false
+
+[Install]
+WantedBy=timers.target

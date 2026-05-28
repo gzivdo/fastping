@@ -1,0 +1,15 @@
+[Unit]
+Description=fastping ICMP sweep -> Zabbix (native sender protocol)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+# CAP_NET_RAW is enough; no need to run as full root.
+AmbientCapabilities=CAP_NET_RAW
+CapabilityBoundingSet=CAP_NET_RAW
+DynamicUser=yes
+ExecStart=/usr/local/bin/fastping -f /etc/fastping/hosts.txt \
+          -o zabbix --key icmp -C 3 --rate 50000 \
+          --server 127.0.0.1:10051
+Nice=5
