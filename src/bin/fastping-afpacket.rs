@@ -14,7 +14,7 @@
 use std::ffi::c_void;
 use std::io::{self, Read};
 use std::mem::size_of;
-use std::net::Ipv4Addr;
+use std::net::{IpAddr, Ipv4Addr};
 use std::os::fd::RawFd;
 use std::sync::atomic::{fence, AtomicU16, AtomicUsize, Ordering};
 
@@ -46,7 +46,14 @@ unsafe impl Sync for AfPacket {}
 unsafe impl Send for AfPacket {}
 
 impl Backend for AfPacket {
-    fn send_to(&self, icmp: &[u8], dst: Ipv4Addr) -> io::Result<()> {
+    fn send_to(&self, icmp: &[u8], dst: IpAddr) -> io::Result<()> {
+        // IPv4-only: ICMPv6 needs a pseudo-header checksum we'd compute by hand.
+        let dst = match dst {
+            IpAddr::V4(a) => a,
+            IpAddr::V6(_) => {
+                return Err(io::Error::other("afpacket backend is IPv4-only (use fastping for IPv6)"))
+            }
+        };
         let total_ip = 20 + icmp.len();
         let mut frame = Vec::with_capacity(14 + total_ip);
         // Ethernet
@@ -93,7 +100,7 @@ impl Backend for AfPacket {
         Ok(())
     }
 
-    fn recv(&self, buf: &mut [u8]) -> Option<(usize, Ipv4Addr)> {
+    fn recv(&self, buf: &mut [u8]) -> Option<(usize, IpAddr)> {
         loop {
             let i = self.cursor.load(Ordering::Relaxed) % self.frame_nr;
             let frame = unsafe { self.ring.add(i * FRAME_SIZE) };
@@ -140,7 +147,7 @@ unsafe fn parse_frame(
     tp_mac: usize,
     tp_len: usize,
     buf: &mut [u8],
-) -> Option<(usize, Ipv4Addr)> {
+) -> Option<(usize, IpAddr)> {
     let data = std::slice::from_raw_parts(frame.add(tp_mac), tp_len);
     // Ethernet
     if data.len() < 14 || data[12] != 0x08 || data[13] != 0x00 {
@@ -154,7 +161,7 @@ unsafe fn parse_frame(
     if ip[9] != 1 {
         return None; // not ICMP
     }
-    let src = Ipv4Addr::new(ip[12], ip[13], ip[14], ip[15]);
+    let src = IpAddr::V4(Ipv4Addr::new(ip[12], ip[13], ip[14], ip[15]));
     let icmp = ip.get(ihl..)?;
     let n = icmp.len().min(buf.len());
     buf[..n].copy_from_slice(&icmp[..n]);

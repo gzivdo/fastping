@@ -14,6 +14,8 @@ adaptive per-host retry queue on top, which the mass scanners deliberately omit.
   alone is enough to score the host and compute RTT.
 * Output modes: `plain`, `fping`-compatible, `zabbix` (native sender protocol),
   and `json` (for Zabbix LLD / Nagios). Integrations for Zabbix and Nagios.
+* **Dual-stack** IPv4 + IPv6; targets as literals, hostnames (A/AAAA), IPv4
+  CIDRs, or files.
 
 ## The idea in plain terms
 
@@ -61,11 +63,13 @@ needs no shared lookup table to know which host it is or how long it took.
   alive/loss/RTT straight into your monitoring — without a 1-process-per-host
   fan-out or a heavyweight scanner.
 
-**Honest limitations:** IPv4 + ICMP echo only; the validation cookie is FNV (fast,
-not cryptographic — fine for a LAN/monitoring, not for hostile Internet spoofing
-yet); AF_PACKET backend routes via the gateway MAC (off-subnet sweeps) and its TX
-isn't zero-copy yet; not tuned for true Internet-scale like zmap (no PF_RING /
-multi-queue). See the roadmap.
+**Honest limitations:** ICMP echo only; targets can be IPv4 **or IPv6** (the
+default socket backend is dual-stack; the AF_PACKET backend is IPv4-only). IPv6
+CIDR expansion is intentionally unsupported — list explicit addresses. The
+validation cookie is FNV (fast, not cryptographic — fine for a LAN/monitoring,
+not for hostile Internet spoofing yet); the AF_PACKET backend routes via the
+gateway MAC (off-subnet sweeps) and its TX isn't zero-copy yet; not tuned for
+true Internet-scale like zmap (no PF_RING / multi-queue). See the roadmap.
 
 ## Backends
 
@@ -73,8 +77,8 @@ Two binaries, same CLI and output modes (shared core in `src/lib.rs`):
 
 | Binary | Transport | Use when |
 |---|---|---|
-| `fastping` | two raw ICMP sockets (kernel builds IP/does routing+ARP) | default; any link incl. loopback and same-subnet hosts |
-| `fastping-afpacket` | AF_PACKET TX + mmap'd `PACKET_RX_RING` | high pps routed/off-subnet sweeps; won't drop replies in a socket buffer |
+| `fastping` | raw ICMP + ICMPv6 sockets (kernel builds IP/does routing+ARP/ND) | default; **dual-stack** (IPv4+IPv6), any link incl. loopback and same-subnet |
+| `fastping-afpacket` | AF_PACKET TX + mmap'd `PACKET_RX_RING` | high pps routed/off-subnet sweeps; won't drop replies in a socket buffer; **IPv4-only** |
 
 `fastping-afpacket` addresses frames to the **default gateway's MAC** (so it is
 for routed sweeps; same-subnet/loopback → use `fastping`). It needs a populated
@@ -95,19 +99,22 @@ sudo setcap cap_net_raw+ep ./target/release/fastping
 fastping [OPTIONS] [IP...]
 
 TARGETS (combine freely; stdin used if none given):
-    IP...                 literal IPv4 addresses
-    -f, --file <path>     file with one "ip" or "ip name" per line
-    -c, --cidr <cidr>     expand an IPv4 CIDR (repeatable)
+    IP...                 IPv4/IPv6 literals or hostnames (resolved to A/AAAA)
+    -f, --file <path>     file with one "ip|host" or "ip|host name" per line
+    -c, --cidr <cidr>     expand an IPv4 CIDR (repeatable; IPv6 not supported)
 
 OPTIONS:
     -t, --timeout <ms>    per-round wait before retry        [default 1500]
     -r, --retries <n>     extra rounds for silent hosts       [default 2]
         --rate <pps>      send rate across the batch, 0=max   [default 0]
         --payload <n>     ICMP payload bytes (min 20)         [default 20]
-    -o, --output <mode>   plain | fping | zabbix             [default plain]
-    -C, --count <n>       probes per host in fping/zabbix     [default 3]
+    -o, --output <mode>   plain | fping | zabbix | json      [default plain]
+    -C, --count <n>       probes per host (fixed-probe modes) [default 3]
+        --discover        zabbix/json: adaptive retry (alive-only) not -C probes
         --key <prefix>    item key prefix in zabbix mode      [default icmp]
         --server <addr>   Zabbix server/proxy host[:10051]
+        --batch <n>       values per Zabbix sender connection [default 1000]
+    -i, --iface <name>    egress interface (afpacket backend only)
 ```
 
 ### Examples
@@ -136,12 +143,21 @@ Zabbix); otherwise the IP string is used.
 |----------|----------------------------------|---------------------------------------------------|
 | `plain`  | round 0 to all, retry silent     | `IP alive <ms>` / `IP down`                       |
 | `fping`  | `-C` probes to **every** host    | `IP : r0 r1 r2` (`-` = lost), like `fping -C -q`  |
-| `zabbix` | `-C` probes to **every** host    | `<key>.alive` (0/1), `<key>.loss` (0..1), `<key>.rtt` (s) |
-| `json`   | `-C` probes to **every** host    | one JSON array `[{ip,name,alive,loss,rtt},…]`     |
+| `zabbix` | `-C` probes to every host, or `--discover` | `<key>.alive` (0/1), `<key>.loss` (0..1), `<key>.rtt` (s) |
+| `json`   | `-C` probes to every host, or `--discover` | one JSON array `[{ip,name,alive,loss,rtt},…]`     |
 
-Loss% is only meaningful when every host gets a fixed number of probes, so
-`fping`/`zabbix` send `-C` probes to all hosts. `plain` keeps the adaptive
-retry (fast alive/dead, no extra traffic to hosts that already answered).
+Two probing strategies, independent of the output format:
+
+* **fixed `-C` probes** to *every* host — needed to measure loss%. Default for
+  `fping`/`zabbix`/`json`.
+* **adaptive retry** — send the batch once, then re-send *only the silent hosts*
+  up to `-r` times (the original idea: fast up/down, no extra traffic to hosts
+  that already answered). Always used by `plain`; opt in for `zabbix`/`json` with
+  `--discover` when you only need alive/down (then `loss` is reported as 0 or 1).
+
+So for a pure liveness check into Zabbix, `fastping -o zabbix --discover -r 2`
+pings each host once and retries just the non-responders — unlike the default
+`-C` mode, which probes everyone N times.
 
 ## sysctl / NIC tuning
 
@@ -255,7 +271,8 @@ many passive results pushed. Define the services as passive on the Nagios side.
   dropping replies in the socket buffer.
 * Encode the cookie cryptographically (SipHash) instead of FNV for spoof
   resistance on the open Internet.
-* IPv6 echo.
+* IPv6 in the AF_PACKET backend (needs a hand-computed ICMPv6 pseudo-header
+  checksum); parallel DNS resolution for large hostname lists.
 * Optional `--stream` mode for early discovery.
 
 ## License

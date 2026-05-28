@@ -13,12 +13,17 @@
 
 use std::collections::HashMap;
 use std::io::{self, BufRead, Write};
-use std::net::Ipv4Addr;
+use std::net::{IpAddr, Ipv4Addr};
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::time::{Duration, Instant};
 
 pub const MAGIC: u32 = 0x5046_5031; // "FPP1"
-pub const HDR: usize = 8; // ICMP echo header length
+pub const HDR: usize = 8; // ICMP(v6) echo header length
+// ICMP echo types: v4 request/reply, then v6 request/reply.
+pub const ICMP4_ECHO: u8 = 8;
+pub const ICMP4_REPLY: u8 = 0;
+pub const ICMP6_ECHO: u8 = 128;
+pub const ICMP6_REPLY: u8 = 129;
 // payload layout after the 8-byte ICMP header:
 //   [0..4] magic, [4..8] index, [8..12] cookie, [12..20] send-ts nanos
 pub const PAYLOAD_MIN: usize = 20;
@@ -28,13 +33,13 @@ pub const PAYLOAD_MIN: usize = 20;
 /// A packet transport. Implementors handle only the wire; all ICMP building and
 /// the stateless validation/scoring live in this module.
 pub trait Backend {
-    /// Send the ICMP message bytes (8-byte header + payload) to `dst`.
-    fn send_to(&self, icmp: &[u8], dst: Ipv4Addr) -> io::Result<()>;
+    /// Send the ICMP(v6) message bytes (8-byte header + payload) to `dst`.
+    fn send_to(&self, icmp: &[u8], dst: IpAddr) -> io::Result<()>;
     /// Block up to a short internal timeout for one echo reply. On success copy
-    /// the ICMP message (starting at the ICMP header) into `buf` and return its
-    /// length plus the source IPv4. Return `None` on timeout so the caller can
-    /// observe shutdown.
-    fn recv(&self, buf: &mut [u8]) -> Option<(usize, Ipv4Addr)>;
+    /// the ICMP(v6) message (starting at the ICMP header) into `buf` and return
+    /// its length plus the source address. Return `None` on timeout so the caller
+    /// can observe shutdown.
+    fn recv(&self, buf: &mut [u8]) -> Option<(usize, IpAddr)>;
 }
 
 // ---- config ----------------------------------------------------------------
@@ -50,7 +55,20 @@ pub struct Config {
     pub zbx_host_mode: HostMode,
     pub zbx_server: Option<String>,
     pub zbx_batch: usize, // values per Zabbix sender connection; 0 = all in one
+    pub discover: bool,   // zabbix/json: use adaptive retry (alive-only) instead of -C probes
     pub iface: Option<String>, // AF_PACKET backend only
+}
+
+/// Probing strategy: adaptive (send once, retry only the silent ones — the
+/// original idea, good for pure alive/down) vs. fixed `-C` probes to every host
+/// (needed to measure loss%). plain is always adaptive; fping always fixed;
+/// zabbix/json default to fixed but switch to adaptive with `--discover`.
+pub fn is_adaptive(cfg: &Config) -> bool {
+    match cfg.output {
+        Output::Plain => true,
+        Output::Fping => false,
+        Output::Zabbix | Output::Json => cfg.discover,
+    }
 }
 
 #[derive(PartialEq)]
@@ -117,6 +135,23 @@ impl Results {
         };
         ((got > 0) as u8, loss, avg)
     }
+    // Adaptive (alive-only) view: liveness + first RTT seconds. Loss is binary
+    // here because adaptive mode does not send a fixed probe count per host.
+    fn liveness(&self, idx: usize) -> (u8, f64, f64) {
+        let first = (0..self.rounds).map(|r| self.round(r, idx)).find(|&v| v >= 0);
+        match first {
+            Some(us) => (1, 0.0, us as f64 / 1_000_000.0),
+            None => (0, 1.0, 0.0),
+        }
+    }
+    // (alive, loss, avg-rtt-seconds) honouring the probing strategy.
+    fn score(&self, idx: usize, adaptive: bool) -> (u8, f64, f64) {
+        if adaptive {
+            self.liveness(idx)
+        } else {
+            self.stats(idx)
+        }
+    }
 }
 
 // ---- ICMP helpers ----------------------------------------------------------
@@ -130,10 +165,13 @@ pub fn fnv1a32(bytes: &[u8]) -> u32 {
     h
 }
 
-pub fn cookie_for(ip: Ipv4Addr, secret: u32) -> u32 {
-    let mut buf = [0u8; 8];
-    buf[0..4].copy_from_slice(&ip.octets());
-    buf[4..8].copy_from_slice(&secret.to_le_bytes());
+pub fn cookie_for(ip: IpAddr, secret: u32) -> u32 {
+    let mut buf = Vec::with_capacity(20);
+    match ip {
+        IpAddr::V4(a) => buf.extend_from_slice(&a.octets()),
+        IpAddr::V6(a) => buf.extend_from_slice(&a.octets()),
+    }
+    buf.extend_from_slice(&secret.to_le_bytes());
     fnv1a32(&buf)
 }
 
@@ -154,29 +192,41 @@ pub fn checksum(data: &[u8]) -> u16 {
     !(sum as u16)
 }
 
-/// Build the ICMP echo-request message (header + payload), checksum included.
-pub fn build_icmp(run_id: u16, round: u16, idx: u32, cookie: u32, ts: u64, payload: usize) -> Vec<u8> {
+/// Build the ICMP(v6) echo-request message (header + payload). For IPv4 the ICMP
+/// checksum is computed here; for ICMPv6 it depends on a pseudo-header, which the
+/// kernel fills in for raw IPPROTO_ICMPV6 sockets, so the field is left zero.
+pub fn build_icmp(
+    v6: bool,
+    run_id: u16,
+    round: u16,
+    idx: u32,
+    cookie: u32,
+    ts: u64,
+    payload: usize,
+) -> Vec<u8> {
     let body = payload.max(PAYLOAD_MIN);
     let mut pkt = vec![0u8; HDR + body];
-    pkt[0] = 8; // echo request
+    pkt[0] = if v6 { ICMP6_ECHO } else { ICMP4_ECHO };
     pkt[1] = 0; // code
-                // [2..4] checksum, filled later
+                // [2..4] checksum, filled below (v4) or by the kernel (v6)
     pkt[4..6].copy_from_slice(&run_id.to_be_bytes());
     pkt[6..8].copy_from_slice(&round.to_be_bytes());
     pkt[HDR..HDR + 4].copy_from_slice(&MAGIC.to_be_bytes());
     pkt[HDR + 4..HDR + 8].copy_from_slice(&idx.to_be_bytes());
     pkt[HDR + 8..HDR + 12].copy_from_slice(&cookie.to_be_bytes());
     pkt[HDR + 12..HDR + 20].copy_from_slice(&ts.to_be_bytes());
-    let cks = checksum(&pkt);
-    pkt[2..4].copy_from_slice(&cks.to_be_bytes());
+    if !v6 {
+        let cks = checksum(&pkt);
+        pkt[2..4].copy_from_slice(&cks.to_be_bytes());
+    }
     pkt
 }
 
 // Validate one received ICMP message against our run and record its RTT.
 fn validate_and_record(
     icmp: &[u8],
-    src: Ipv4Addr,
-    targets: &[Ipv4Addr],
+    src: IpAddr,
+    targets: &[IpAddr],
     run_id: u16,
     secret: u32,
     now_ns: u64,
@@ -185,8 +235,8 @@ fn validate_and_record(
     if icmp.len() < HDR + PAYLOAD_MIN {
         return;
     }
-    if icmp[0] != 0 {
-        return; // not an echo reply
+    if icmp[0] != ICMP4_REPLY && icmp[0] != ICMP6_REPLY {
+        return; // not an echo reply (v4 or v6)
     }
     if u16::from_be_bytes([icmp[4], icmp[5]]) != run_id {
         return; // not ours
@@ -214,7 +264,7 @@ fn validate_and_record(
 // Send one round to the given indices, paced to cfg.rate.
 fn send_round<B: Backend>(
     backend: &B,
-    targets: &[Ipv4Addr],
+    targets: &[IpAddr],
     idxs: &[usize],
     round: u16,
     run_id: u16,
@@ -231,7 +281,15 @@ fn send_round<B: Backend>(
     for &i in idxs {
         let ip = targets[i];
         let ts = start.elapsed().as_nanos() as u64;
-        let pkt = build_icmp(run_id, round, i as u32, cookie_for(ip, secret), ts, cfg.payload);
+        let pkt = build_icmp(
+            ip.is_ipv6(),
+            run_id,
+            round,
+            i as u32,
+            cookie_for(ip, secret),
+            ts,
+            cfg.payload,
+        );
         let _ = backend.send_to(&pkt, ip);
         if let Some(g) = gap {
             next += g;
@@ -244,15 +302,15 @@ fn send_round<B: Backend>(
 }
 
 /// Drive a full sweep over `targets` using `backend`, returning the results.
-pub fn run<B: Backend + Sync>(backend: &B, cfg: &Config, targets: &[Ipv4Addr]) -> Results {
+pub fn run<B: Backend + Sync>(backend: &B, cfg: &Config, targets: &[IpAddr]) -> Results {
     let n = targets.len();
-    // fping/zabbix/json measure loss over a fixed number of probes sent to every
-    // host; plain discovery instead retries only the silent hosts.
-    let fixed_probes = matches!(cfg.output, Output::Fping | Output::Zabbix | Output::Json);
-    let rounds = if fixed_probes {
-        cfg.count.max(1) as usize
-    } else {
+    // adaptive: send once, retry only the silent ones (alive/down, minimal traffic).
+    // fixed: -C probes to every host (needed for loss%).
+    let adaptive = is_adaptive(cfg);
+    let rounds = if adaptive {
         (cfg.retries + 1) as usize
+    } else {
+        cfg.count.max(1) as usize
     };
     let results = Results::new(n, rounds);
 
@@ -279,13 +337,7 @@ pub fn run<B: Backend + Sync>(backend: &B, cfg: &Config, targets: &[Ipv4Addr]) -
             }
         });
 
-        if fixed_probes {
-            let all: Vec<usize> = (0..n).collect();
-            for r in 0..rounds {
-                send_round(backend, targets, &all, r as u16, run_id, secret, start, cfg);
-                std::thread::sleep(cfg.timeout);
-            }
-        } else {
+        if adaptive {
             let mut pending: Vec<usize> = (0..n).collect();
             for r in 0..rounds {
                 if pending.is_empty() {
@@ -294,6 +346,12 @@ pub fn run<B: Backend + Sync>(backend: &B, cfg: &Config, targets: &[Ipv4Addr]) -
                 send_round(backend, targets, &pending, r as u16, run_id, secret, start, cfg);
                 std::thread::sleep(cfg.timeout);
                 pending.retain(|&i| !results.responded_any(i));
+            }
+        } else {
+            let all: Vec<usize> = (0..n).collect();
+            for r in 0..rounds {
+                send_round(backend, targets, &all, r as u16, run_id, secret, start, cfg);
+                std::thread::sleep(cfg.timeout);
             }
         }
 
@@ -307,7 +365,7 @@ pub fn run<B: Backend + Sync>(backend: &B, cfg: &Config, targets: &[Ipv4Addr]) -
 
 // ---- reporting -------------------------------------------------------------
 
-pub fn report(cfg: &Config, targets: &[Ipv4Addr], names: &[String], res: &Results) {
+pub fn report(cfg: &Config, targets: &[IpAddr], names: &[String], res: &Results) {
     let out = io::stdout();
     let mut w = out.lock();
     match cfg.output {
@@ -339,13 +397,14 @@ pub fn report(cfg: &Config, targets: &[Ipv4Addr], names: &[String], res: &Result
             }
         }
         Output::Zabbix => {
+            let adaptive = is_adaptive(cfg);
             let mut items: Vec<(String, String, String)> = Vec::with_capacity(targets.len() * 3);
             for (i, ip) in targets.iter().enumerate() {
                 let host = match cfg.zbx_host_mode {
                     HostMode::Ip => ip.to_string(),
                     HostMode::Resolved => names[i].clone(),
                 };
-                let (alive, loss, avg) = res.stats(i);
+                let (alive, loss, avg) = res.score(i, adaptive);
                 items.push((host.clone(), format!("{}.alive", cfg.zbx_key), alive.to_string()));
                 items.push((host.clone(), format!("{}.loss", cfg.zbx_key), format!("{loss:.4}")));
                 items.push((host, format!("{}.rtt", cfg.zbx_key), format!("{avg:.6}")));
@@ -368,9 +427,10 @@ pub fn report(cfg: &Config, targets: &[Ipv4Addr], names: &[String], res: &Result
             }
         }
         Output::Json => {
+            let adaptive = is_adaptive(cfg);
             let mut sbuf = String::from("[");
             for (i, ip) in targets.iter().enumerate() {
-                let (alive, loss, avg) = res.stats(i);
+                let (alive, loss, avg) = res.score(i, adaptive);
                 if i > 0 {
                     sbuf.push(',');
                 }
@@ -508,7 +568,7 @@ fn next_val(
     args.next().ok_or_else(|| format!("{flag} needs a value"))
 }
 
-pub fn parse_args() -> Result<(Config, Vec<(Ipv4Addr, String)>), String> {
+pub fn parse_args() -> Result<(Config, Vec<(IpAddr, String)>), String> {
     let mut cfg = Config {
         timeout: Duration::from_millis(1500),
         retries: 2,
@@ -520,9 +580,10 @@ pub fn parse_args() -> Result<(Config, Vec<(Ipv4Addr, String)>), String> {
         zbx_host_mode: HostMode::Ip,
         zbx_server: None,
         zbx_batch: 1000,
+        discover: false,
         iface: None,
     };
-    let mut targets: Vec<(Ipv4Addr, String)> = Vec::new();
+    let mut targets: Vec<(IpAddr, String)> = Vec::new();
     let mut file: Option<String> = None;
     let mut cidrs: Vec<String> = Vec::new();
 
@@ -556,12 +617,14 @@ pub fn parse_args() -> Result<(Config, Vec<(Ipv4Addr, String)>), String> {
             "--key" => cfg.zbx_key = next_val(&mut args, &a)?,
             "--server" => cfg.zbx_server = Some(next_val(&mut args, &a)?),
             "--batch" => cfg.zbx_batch = next_val(&mut args, &a)?.parse().map_err(|_| "bad batch")?,
+            "--discover" | "--alive" => cfg.discover = true,
             "-i" | "--iface" => cfg.iface = Some(next_val(&mut args, &a)?),
             "-f" | "--file" => file = Some(next_val(&mut args, &a)?),
             "-c" | "--cidr" => cidrs.push(next_val(&mut args, &a)?),
             "-h" | "--help" => return Err("help".to_string()),
             other if !other.starts_with('-') => {
-                let ip: Ipv4Addr = other.parse().map_err(|_| format!("bad IP: {other}"))?;
+                // an IPv4/IPv6 literal or a hostname to resolve
+                let ip = resolve_ip(other)?;
                 targets.push((ip, other.to_string()));
             }
             other => return Err(format!("unknown flag: {other}")),
@@ -587,7 +650,7 @@ pub fn parse_args() -> Result<(Config, Vec<(Ipv4Addr, String)>), String> {
     Ok((cfg, targets))
 }
 
-fn read_lines<R: BufRead>(r: R, out: &mut Vec<(Ipv4Addr, String)>) -> Result<(), String> {
+fn read_lines<R: BufRead>(r: R, out: &mut Vec<(IpAddr, String)>) -> Result<(), String> {
     for line in r.lines() {
         let line = line.map_err(|e| e.to_string())?;
         let s = line.trim();
@@ -596,15 +659,37 @@ fn read_lines<R: BufRead>(r: R, out: &mut Vec<(Ipv4Addr, String)>) -> Result<(),
         }
         let mut it = s.split_whitespace();
         let ipt = it.next().unwrap();
-        let ip: Ipv4Addr = ipt.parse().map_err(|_| format!("bad IP: {ipt}"))?;
+        let ip = resolve_ip(ipt)?;
+        // explicit display name if given, else the token (IP or hostname) itself
         let name = it.next().unwrap_or(ipt).to_string();
         out.push((ip, name));
     }
     Ok(())
 }
 
-fn expand_cidr(s: &str) -> Result<Vec<Ipv4Addr>, String> {
+// Accept an IPv4/IPv6 literal, or resolve a hostname to its first A/AAAA record.
+// Resolution is blocking and serial — fine for CLI/file convenience; for mass
+// sweeps pass IPs (those never trigger DNS).
+fn resolve_ip(host: &str) -> Result<IpAddr, String> {
+    if let Ok(ip) = host.parse::<IpAddr>() {
+        return Ok(ip);
+    }
+    use std::net::ToSocketAddrs;
+    (host, 0u16)
+        .to_socket_addrs()
+        .map_err(|e| format!("cannot resolve {host}: {e}"))?
+        .map(|sa| sa.ip())
+        .next()
+        .ok_or_else(|| format!("no address for {host}"))
+}
+
+// IPv4-only: expanding IPv6 prefixes is intentionally unsupported (the space is
+// astronomically large). List explicit IPv6 addresses instead.
+fn expand_cidr(s: &str) -> Result<Vec<IpAddr>, String> {
     let (base, prefix) = s.split_once('/').ok_or_else(|| format!("not a CIDR: {s}"))?;
+    if base.contains(':') {
+        return Err("IPv6 CIDR expansion is not supported — list explicit addresses".to_string());
+    }
     let ip: Ipv4Addr = base.parse().map_err(|_| format!("bad IP: {base}"))?;
     let p: u32 = prefix.parse().map_err(|_| format!("bad prefix: {prefix}"))?;
     if p > 32 {
@@ -617,13 +702,13 @@ fn expand_cidr(s: &str) -> Result<Vec<Ipv4Addr>, String> {
     } else {
         (base as u64, base as u64 + count)
     };
-    Ok((lo..hi).map(|a| Ipv4Addr::from(a as u32)).collect())
+    Ok((lo..hi).map(|a| IpAddr::V4(Ipv4Addr::from(a as u32))).collect())
 }
 
 /// Dedupe targets, preserving order and the chosen display name. Returns the IPs,
 /// matching names, and whether any name differs from its IP (→ resolved host mode).
-pub fn dedupe(raw: Vec<(Ipv4Addr, String)>) -> (Vec<Ipv4Addr>, Vec<String>, bool) {
-    let mut seen: HashMap<Ipv4Addr, ()> = HashMap::new();
+pub fn dedupe(raw: Vec<(IpAddr, String)>) -> (Vec<IpAddr>, Vec<String>, bool) {
+    let mut seen: HashMap<IpAddr, ()> = HashMap::new();
     let mut targets = Vec::with_capacity(raw.len());
     let mut names = Vec::with_capacity(raw.len());
     for (ip, name) in raw {
@@ -645,9 +730,9 @@ USAGE:
     cat hosts.txt | fastping -o fping -C 3
 
 TARGETS (combine freely; stdin used if none given):
-    IP...                 literal IPv4 addresses
-    -f, --file <path>     file with one \"ip\" or \"ip name\" per line
-    -c, --cidr <cidr>     expand an IPv4 CIDR (repeatable)
+    IP...                 IPv4/IPv6 literals or hostnames (resolved to A/AAAA)
+    -f, --file <path>     file with one \"ip|host\" or \"ip|host name\" per line
+    -c, --cidr <cidr>     expand an IPv4 CIDR (repeatable; IPv6 not supported)
 
 OPTIONS:
     -t, --timeout <ms>    per-round wait before retry        [default 1500]
@@ -655,7 +740,9 @@ OPTIONS:
         --rate <pps>      send rate across the batch, 0=max   [default 0]
         --payload <n>     ICMP payload bytes (min 20)         [default 20]
     -o, --output <mode>   plain | fping | zabbix | json      [default plain]
-    -C, --count <n>       probes per host in fping/zabbix     [default 3]
+    -C, --count <n>       probes per host (fixed-probe modes)  [default 3]
+        --discover        zabbix/json: adaptive retry (alive-only, retries just
+                          the silent ones) instead of -C probes; loss is 0/1
         --key <prefix>    item key prefix in zabbix mode      [default icmp]
         --server <addr>   Zabbix server/proxy host[:10051]
         --batch <n>       values per Zabbix sender connection, 0=all [default 1000]
