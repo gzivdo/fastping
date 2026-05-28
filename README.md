@@ -1,5 +1,7 @@
 # fastping
 
+📖 **[Документация на русском →](README.ru.md)**
+
 Stateless mass ICMP-echo sweeper. Fires a whole batch of echo requests from one
 raw socket while a second raw socket records replies — no per-packet locking
 between them — then re-sends only the hosts that stayed silent, for a few
@@ -10,8 +12,60 @@ adaptive per-host retry queue on top, which the mass scanners deliberately omit.
 * No state map on the hot path: the target index, a per-run validation cookie and
   the send timestamp are embedded in the ICMP payload and echoed back, so a reply
   alone is enough to score the host and compute RTT.
-* Three output modes: `plain`, `fping`-compatible, and `zabbix` (native sender
-  protocol or `zabbix_sender` input lines).
+* Output modes: `plain`, `fping`-compatible, `zabbix` (native sender protocol),
+  and `json` (for Zabbix LLD / Nagios). Integrations for Zabbix and Nagios.
+
+## The idea in plain terms
+
+Ordinary `ping` walks one host at a time: send, wait for the reply (or timeout),
+move on. `fping` is smarter — it interleaves many hosts round-robin — but still
+runs everything through one process loop. With thousands of hosts, most of the
+wall-clock time is spent *waiting*.
+
+fastping instead **mails all the letters at once**: one thread blasts the entire
+batch of echo requests, a second thread just catches whatever comes back. It
+keeps a checklist of who answered; after a short wait it re-sends **only the
+silent ones**, a couple of times. So the total time is roughly "one timeout, plus
+a couple of retries for stragglers" — not "timeout × number of hosts".
+
+The trick that makes the receiver cheap: every probe carries its target's index,
+a validation cookie and the send timestamp *inside the ICMP payload*, which the
+host echoes back. So a single reply packet is self-describing — the receiver
+needs no shared lookup table to know which host it is or how long it took.
+
+## How it compares
+
+| Tool | Model | Adaptive retry | Per-host loss/RTT | Monitoring output | Best at |
+|---|---|---|---|---|---|
+| `ping` | 1 host, blocking | — | yes | — | a single host |
+| `fping` | many hosts, round-robin, 1 socket | blind resend | yes | text | LAN sweeps, scripts |
+| `nmap -sn` | host discovery, feature-rich | yes | limited | XML/grep | discovery + extra probes |
+| `zmap` | stateless, Internet-scale | **no** (fire-and-forget) | no (survey) | needs post-proc | one-shot Internet surveys |
+| `masscan` | stateless, TCP-focused | no | no | lists | Internet-wide port scans |
+| **fastping** | **stateless batch + adaptive retry** | **yes** | **yes** | **Zabbix/Nagios/JSON built-in** | **repeated monitoring sweeps of many known hosts** |
+
+**Why it's different / better for its niche:**
+
+* **vs `fping`** — same "alive + loss + RTT with retries" semantics, but the
+  zmap-style async batch scales to far larger host counts, and the AF_PACKET +
+  `PACKET_RX_RING` backend stops dropping replies under load (a dropped reply in
+  `fping` looks like a false "down"). Plus native Zabbix/Nagios/JSON output, so
+  there's nothing to parse.
+* **vs `zmap`/`masscan`** — they're faster for one-shot Internet surveys, but are
+  deliberately *fire-and-forget*: no per-host retry, no convenient loss/RTT, and
+  you post-process a result dump. fastping keeps their stateless hot path yet adds
+  exactly the bits monitoring needs — an adaptive retry queue and ready-to-ship
+  per-host metrics.
+* **The niche:** you have N *known* hosts (a Zabbix/Nagios inventory, a few /16s)
+  and you want to sweep them **repeatedly, fast, and reliably**, pushing
+  alive/loss/RTT straight into your monitoring — without a 1-process-per-host
+  fan-out or a heavyweight scanner.
+
+**Honest limitations:** IPv4 + ICMP echo only; the validation cookie is FNV (fast,
+not cryptographic — fine for a LAN/monitoring, not for hostile Internet spoofing
+yet); AF_PACKET backend routes via the gateway MAC (off-subnet sweeps) and its TX
+isn't zero-copy yet; not tuned for true Internet-scale like zmap (no PF_RING /
+multi-queue). See the roadmap.
 
 ## Backends
 
@@ -164,6 +218,37 @@ pattern (in the template):
 2. a low-frequency built-in `icmpping` (active, fping-based) backup item, read
    only when the trapper item is stale.
 
+## Nagios / Icinga integration
+
+Two wrappers in [`nagios/`](nagios/):
+
+**Active, single host** — [`nagios/check_fastping`](nagios/check_fastping), a
+drop-in-ish replacement for `check_icmp`/`check_ping`:
+
+```
+check_fastping -H 8.8.8.8 -w 20,200 -c 100,500 -C 5
+# FASTPING OK - 8.8.8.8 rta 2.207ms, lost 0% | rta=2.207ms;200;500;0; pl=0%;20;100;0;100
+```
+
+Returns OK/WARNING/CRITICAL/UNKNOWN with `rta`/`pl` perfdata. `-w`/`-c` are
+`loss%,rta_ms`. Use `-b afpacket` for the AF_PACKET backend. One process per
+host, like the stock plugins — simple, but no batching.
+
+**Batch, passive (preserves batching)** —
+[`nagios/fastping-passive.sh`](nagios/fastping-passive.sh) sweeps the whole list
+in one run, then submits one passive result per host **as text** to the Nagios
+external command pipe (a FIFO) or to an NSCA daemon over TCP:
+
+```sh
+# host file: "ip nagios_host_name" per line
+fastping-passive.sh -f hosts.txt -s ICMP -C 5 -P /usr/local/nagios/var/rw/nagios.cmd
+# -> [<ts>] PROCESS_SERVICE_CHECK_RESULT;<host>;ICMP;<rc>;<output|perfdata>
+fastping-passive.sh -f hosts.txt -s ICMP --nsca nagios-host:5667
+```
+
+This is the Nagios analogue of the Zabbix trapper model: one fast batch sweep,
+many passive results pushed. Define the services as passive on the Nagios side.
+
 ## Roadmap
 
 * `AF_PACKET` + `PACKET_TX/RX_RING` (mmap) for true multi-Mpps and to stop
@@ -171,3 +256,8 @@ pattern (in the template):
 * Encode the cookie cryptographically (SipHash) instead of FNV for spoof
   resistance on the open Internet.
 * IPv6 echo.
+* Optional `--stream` mode for early discovery.
+
+## License
+
+MIT — see [LICENSE](LICENSE).

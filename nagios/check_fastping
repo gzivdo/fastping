@@ -1,0 +1,68 @@
+#!/usr/bin/env bash
+# check_fastping — Nagios/Icinga active check plugin (single host) backed by fastping.
+# Drop-in-ish replacement for check_icmp/check_ping: returns the standard
+# OK/WARNING/CRITICAL/UNKNOWN status plus rta/pl perfdata.
+#
+# Usage: check_fastping -H <host> [-w loss%,rta_ms] [-c loss%,rta_ms]
+#                       [-C count] [-t timeout_ms] [-b socket|afpacket] [-i iface]
+# Env:   FASTPING_BIN=/path/to/fastping (default: fastping / fastping-afpacket on PATH)
+set -u
+
+OK=0; WARN=1; CRIT=2; UNK=3
+host=""; wloss=20; wrta=200; closs=100; crta=500
+count=5; timeout=1000; backend="socket"; iface=""
+
+die_unknown() { echo "FASTPING UNKNOWN - $1"; exit $UNK; }
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -H) host="$2"; shift 2;;
+    -w) wloss="${2%%,*}"; wrta="${2##*,}"; shift 2;;
+    -c) closs="${2%%,*}"; crta="${2##*,}"; shift 2;;
+    -C) count="$2"; shift 2;;
+    -t) timeout="$2"; shift 2;;
+    -b) backend="$2"; shift 2;;
+    -i) iface="$2"; shift 2;;
+    -h|--help) sed -n '2,9p' "$0"; exit $UNK;;
+    *) die_unknown "unknown arg: $1";;
+  esac
+done
+[ -n "$host" ] || die_unknown "missing -H <host>"
+
+# pick the binary
+if [ -n "${FASTPING_BIN:-}" ]; then bin="$FASTPING_BIN"
+elif [ "$backend" = "afpacket" ]; then bin="fastping-afpacket"
+else bin="fastping"; fi
+command -v "$bin" >/dev/null 2>&1 || die_unknown "$bin not found on PATH"
+
+ifopt=""; [ -n "$iface" ] && ifopt="-i $iface"
+out="$("$bin" -o json -C "$count" -t "$timeout" $ifopt "$host" 2>/dev/null)" \
+  || die_unknown "fastping failed (CAP_NET_RAW? setcap cap_net_raw+ep $bin)"
+
+alive=$(printf '%s' "$out" | grep -oE '"alive":[0-9]+'      | head -1 | grep -oE '[0-9]+')
+loss=$( printf '%s' "$out" | grep -oE '"loss":[0-9.]+'      | head -1 | grep -oE '[0-9.]+')
+rtt=$(  printf '%s' "$out" | grep -oE '"rtt":[0-9.]+'       | head -1 | grep -oE '[0-9.]+')
+[ -n "$alive" ] && [ -n "$loss" ] && [ -n "$rtt" ] || die_unknown "could not parse fastping output"
+
+# loss 0..1 -> %, rtt seconds -> ms; decide status with awk (float-safe)
+read -r status rc <<EOF
+$(awk -v alive="$alive" -v loss="$loss" -v rtt="$rtt" \
+       -v wl="$wloss" -v wr="$wrta" -v cl="$closs" -v cr="$crta" 'BEGIN{
+  plc = loss*100; rta = rtt*1000;
+  if (alive==0 || plc>=cl || rta>=cr) print "CRITICAL", 2;
+  else if (plc>=wl || rta>=wr)        print "WARNING", 1;
+  else                                print "OK", 0;
+}')
+EOF
+
+pl=$(awk -v l="$loss" 'BEGIN{printf "%.0f", l*100}')
+rta=$(awk -v r="$rtt" 'BEGIN{printf "%.3f", r*1000}')
+if [ "$alive" = "0" ]; then
+  msg="$host is DOWN (100% loss)"
+  perf="rta=;${wrta};${crta};0; pl=${pl}%;${wloss};${closs};0;100"
+else
+  msg="$host rta ${rta}ms, lost ${pl}%"
+  perf="rta=${rta}ms;${wrta};${crta};0; pl=${pl}%;${wloss};${closs};0;100"
+fi
+echo "FASTPING $status - $msg | $perf"
+exit "$rc"
