@@ -80,6 +80,11 @@ Two binaries, same CLI and output modes (shared core in `src/lib.rs`):
 | `fastping` | raw ICMP + ICMPv6 sockets (kernel builds IP/does routing+ARP/ND) | default; **dual-stack** (IPv4+IPv6), any link incl. loopback and same-subnet |
 | `fastping-afpacket` | AF_PACKET TX + mmap'd `PACKET_RX_RING` | high pps routed/off-subnet sweeps; won't drop replies in a socket buffer; **IPv4-only** |
 
+The `fastping` receive side uses **one blocking thread per address family**, each
+draining its socket with `recvmmsg(MSG_WAITFORONE)` — a whole batch of replies
+per syscall, no `poll` on the hot path. Only the families present in the target
+set are opened, so there's no idle IPv6 thread when there are no v6 targets.
+
 `fastping-afpacket` addresses frames to the **default gateway's MAC** (so it is
 for routed sweeps; same-subnet/loopback → use `fastping`). It needs a populated
 ARP entry for the gateway (`ping <gw>` once if missing) and `-i/--iface` to

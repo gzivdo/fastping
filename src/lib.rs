@@ -35,11 +35,12 @@ pub const PAYLOAD_MIN: usize = 20;
 pub trait Backend {
     /// Send the ICMP(v6) message bytes (8-byte header + payload) to `dst`.
     fn send_to(&self, icmp: &[u8], dst: IpAddr) -> io::Result<()>;
-    /// Block up to a short internal timeout for one echo reply. On success copy
-    /// the ICMP(v6) message (starting at the ICMP header) into `buf` and return
-    /// its length plus the source address. Return `None` on timeout so the caller
-    /// can observe shutdown.
-    fn recv(&self, buf: &mut [u8]) -> Option<(usize, IpAddr)>;
+    /// Own the receive loop while `running` is true, invoking `on_reply(icmp, src)`
+    /// for each received packet — `icmp` starts at the ICMP(v6) header, `src` is
+    /// the source address. The backend decides how to read (e.g. blocking
+    /// recvmmsg per socket, or draining a PACKET_RX_RING) and may spawn its own
+    /// threads. Must observe `running` often enough to exit promptly once cleared.
+    fn receive(&self, running: &AtomicBool, on_reply: &(dyn Fn(&[u8], IpAddr) + Sync));
 }
 
 // ---- config ----------------------------------------------------------------
@@ -83,6 +84,22 @@ pub enum Output {
 pub enum HostMode {
     Ip,
     Resolved,
+}
+
+/// Which address families the target set actually contains. Computed after
+/// parsing/resolving so a backend opens only the sockets (and spawns only the
+/// receive threads) it needs — e.g. no IPv6 thread when there are no v6 targets.
+#[derive(Clone, Copy)]
+pub struct Families {
+    pub v4: bool,
+    pub v6: bool,
+}
+
+pub fn target_families(targets: &[IpAddr]) -> Families {
+    Families {
+        v4: targets.iter().any(|t| t.is_ipv4()),
+        v6: targets.iter().any(|t| t.is_ipv6()),
+    }
 }
 
 // ---- results ---------------------------------------------------------------
@@ -325,17 +342,16 @@ pub fn run<B: Backend + Sync>(backend: &B, cfg: &Config, targets: &[IpAddr]) -> 
     let start = Instant::now();
     let running = AtomicBool::new(true);
 
+    // stateless scoring sink shared by all of the backend's receive threads
+    let sink = |icmp: &[u8], src: IpAddr| {
+        let now = start.elapsed().as_nanos() as u64;
+        validate_and_record(icmp, src, targets, run_id, secret, now, &results);
+    };
+    let sink_ref: &(dyn Fn(&[u8], IpAddr) + Sync) = &sink;
+
     std::thread::scope(|s| {
-        // receiver: stateless, runs until the sender signals shutdown
-        s.spawn(|| {
-            let mut buf = [0u8; 2048];
-            while running.load(Ordering::Relaxed) {
-                if let Some((len, src)) = backend.recv(&mut buf) {
-                    let now = start.elapsed().as_nanos() as u64;
-                    validate_and_record(&buf[..len], src, targets, run_id, secret, now, &results);
-                }
-            }
-        });
+        // receiver: the backend owns its read loop(s) until shutdown
+        s.spawn(|| backend.receive(&running, sink_ref));
 
         if adaptive {
             let mut pending: Vec<usize> = (0..n).collect();
@@ -755,7 +771,9 @@ Requires CAP_NET_RAW (run as root or: setcap cap_net_raw+ep ./fastping).
 
 /// Shared CLI entry point. `make_backend` constructs the transport from the
 /// parsed config; everything else (arg parsing, sweep, reporting) is common.
-pub fn cli<B: Backend + Sync>(make_backend: impl FnOnce(&Config) -> io::Result<B>) -> ! {
+pub fn cli<B: Backend + Sync>(
+    make_backend: impl FnOnce(&Config, Families) -> io::Result<B>,
+) -> ! {
     let (cfg, raw_targets) = match parse_args() {
         Ok(v) => v,
         Err(e) => {
@@ -775,7 +793,7 @@ pub fn cli<B: Backend + Sync>(make_backend: impl FnOnce(&Config) -> io::Result<B
         cfg.zbx_host_mode = HostMode::Resolved;
     }
 
-    let backend = match make_backend(&cfg) {
+    let backend = match make_backend(&cfg, target_families(&targets)) {
         Ok(b) => b,
         Err(e) => {
             let denied = e.kind() == io::ErrorKind::PermissionDenied;

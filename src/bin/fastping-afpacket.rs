@@ -16,9 +16,9 @@ use std::io::{self, Read};
 use std::mem::size_of;
 use std::net::{IpAddr, Ipv4Addr};
 use std::os::fd::RawFd;
-use std::sync::atomic::{fence, AtomicU16, AtomicUsize, Ordering};
+use std::sync::atomic::{fence, AtomicBool, AtomicU16, AtomicUsize, Ordering};
 
-use fastping::{checksum, cli, Backend, Config};
+use fastping::{checksum, cli, Backend, Config, Families};
 
 const TP_STATUS_USER: libc::c_ulong = 1;
 const TP_STATUS_KERNEL: libc::c_ulong = 0;
@@ -100,31 +100,35 @@ impl Backend for AfPacket {
         Ok(())
     }
 
-    fn recv(&self, buf: &mut [u8]) -> Option<(usize, IpAddr)> {
-        loop {
-            let i = self.cursor.load(Ordering::Relaxed) % self.frame_nr;
-            let frame = unsafe { self.ring.add(i * FRAME_SIZE) };
-            let hdr = frame as *mut libc::tpacket_hdr;
-            let status = unsafe { std::ptr::read_volatile(&(*hdr).tp_status) };
-            if status & TP_STATUS_USER == 0 {
-                // nothing ready in this slot — wait briefly, then re-check
-                if !self.poll(200) {
-                    return None;
+    fn receive(&self, running: &AtomicBool, on_reply: &(dyn Fn(&[u8], IpAddr) + Sync)) {
+        // single RX thread draining the mmap ring; poll() only blocks when the
+        // ring is momentarily empty (legitimate use — waiting for it to fill).
+        let mut buf = [0u8; 2048];
+        while running.load(Ordering::Relaxed) {
+            let mut drained = false;
+            loop {
+                let i = self.cursor.load(Ordering::Relaxed) % self.frame_nr;
+                let frame = unsafe { self.ring.add(i * FRAME_SIZE) };
+                let hdr = frame as *mut libc::tpacket_hdr;
+                let status = unsafe { std::ptr::read_volatile(&(*hdr).tp_status) };
+                if status & TP_STATUS_USER == 0 {
+                    break; // ring empty for now
                 }
-                continue;
+                fence(Ordering::Acquire);
+                let tp_mac = unsafe { (*hdr).tp_mac } as usize;
+                let tp_len = unsafe { (*hdr).tp_len } as usize;
+                if let Some((len, src)) = unsafe { parse_frame(frame, tp_mac, tp_len, &mut buf) } {
+                    on_reply(&buf[..len], src);
+                }
+                // release the slot back to the kernel
+                fence(Ordering::Release);
+                unsafe { std::ptr::write_volatile(&raw mut (*hdr).tp_status, TP_STATUS_KERNEL) };
+                self.cursor.fetch_add(1, Ordering::Relaxed);
+                drained = true;
             }
-            fence(Ordering::Acquire);
-            let tp_mac = unsafe { (*hdr).tp_mac } as usize;
-            let tp_len = unsafe { (*hdr).tp_len } as usize;
-            let parsed = unsafe { parse_frame(frame, tp_mac, tp_len, buf) };
-            // release the slot back to the kernel
-            fence(Ordering::Release);
-            unsafe { std::ptr::write_volatile(&raw mut (*hdr).tp_status, TP_STATUS_KERNEL) };
-            self.cursor.fetch_add(1, Ordering::Relaxed);
-            if parsed.is_some() {
-                return parsed;
+            if !drained {
+                self.poll(200); // wait for the ring to fill, then re-check stop
             }
-            // not an ICMP reply — keep scanning
         }
     }
 }
@@ -239,7 +243,10 @@ fn local_src_ip(gw: Ipv4Addr) -> io::Result<Ipv4Addr> {
     }
 }
 
-fn make(cfg: &Config) -> io::Result<AfPacket> {
+fn make(cfg: &Config, fam: Families) -> io::Result<AfPacket> {
+    if fam.v6 {
+        eprintln!("fastping: warning: afpacket backend is IPv4-only; IPv6 targets will report down (use fastping for IPv6)");
+    }
     let (route_if, gw) = discover_route()?;
     let iface = cfg.iface.clone().unwrap_or(route_if);
     let ifindex = {
